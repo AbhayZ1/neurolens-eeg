@@ -1,0 +1,372 @@
+<title>NeuroLens Execution Roadmap</title>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+:root{
+  --paper:#faf9f6;
+  --panel:#f1f0eb;
+  --line:#ddddd3;
+  --ink:#1a1c1a;
+  --graphite:#63665f;
+  --signal:#0f7d7d;
+  --signal-soft:#e2f1f0;
+  --warn-ink:#5c4300;
+  --warn-bg:#fbf1d8;
+  --warn-line:#d8b74a;
+  --ok-ink:#1f5c3d;
+  --ok-bg:#e6f3ea;
+  --code-bg:#191b17;
+  --code-ink:#e7e6df;
+  --code-accent:#7fd9c4;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --paper:#141613;
+    --panel:#1b1e1a;
+    --line:#2c302b;
+    --ink:#eceae3;
+    --graphite:#9a9d94;
+    --signal:#4fd6c6;
+    --signal-soft:#183330;
+    --warn-ink:#f0d998;
+    --warn-bg:#2c2510;
+    --warn-line:#6b5623;
+    --ok-ink:#a9e0c0;
+    --ok-bg:#12281c;
+    --code-bg:#0c0d0b;
+    --code-ink:#e7e6df;
+    --code-accent:#7fd9c4;
+  }
+}
+:root[data-theme="dark"]{
+  --paper:#141613;
+  --panel:#1b1e1a;
+  --line:#2c302b;
+  --ink:#eceae3;
+  --graphite:#9a9d94;
+  --signal:#4fd6c6;
+  --signal-soft:#183330;
+  --warn-ink:#f0d998;
+  --warn-bg:#2c2510;
+  --warn-line:#6b5623;
+  --ok-ink:#a9e0c0;
+  --ok-bg:#12281c;
+  --code-bg:#0c0d0b;
+  --code-ink:#e7e6df;
+  --code-accent:#7fd9c4;
+}
+
+*{box-sizing:border-box}
+body{
+  background:var(--paper);
+  color:var(--ink);
+  font-family:"IBM Plex Sans",-apple-system,"Segoe UI",sans-serif;
+  font-size:16px;
+  line-height:1.6;
+  max-width:760px;
+  margin:0 auto;
+  padding:3.2rem 1.5rem 6rem;
+}
+
+/* ---------- masthead ---------- */
+.masthead{margin-bottom:2.6rem}
+.eyebrow{
+  font-family:"IBM Plex Mono",monospace;
+  font-size:.72rem;
+  font-weight:600;
+  letter-spacing:.14em;
+  text-transform:uppercase;
+  color:var(--signal);
+  display:flex;
+  align-items:center;
+  gap:.55rem;
+}
+.eyebrow::before{
+  content:"";
+  display:inline-block;
+  width:.5rem;height:.5rem;
+  background:var(--signal);
+  border-radius:1px;
+}
+h1{
+  font-family:"IBM Plex Mono",monospace;
+  font-size:1.9rem;
+  font-weight:700;
+  letter-spacing:-.01em;
+  margin:.5rem 0 .35rem;
+  text-wrap:balance;
+}
+p.lede{color:var(--graphite);font-size:1.02rem;max-width:60ch}
+
+/* ---------- headings ---------- */
+h2{
+  font-family:"IBM Plex Mono",monospace;
+  font-size:1.05rem;
+  font-weight:600;
+  margin-top:3rem;
+  margin-bottom:1rem;
+  padding-bottom:.55rem;
+  border-bottom:1px solid var(--line);
+  display:flex;
+  align-items:baseline;
+  gap:.6rem;
+}
+h2 .stage-idx{color:var(--signal);font-weight:700}
+h3{
+  font-family:"IBM Plex Mono",monospace;
+  font-size:.88rem;
+  font-weight:600;
+  color:var(--signal);
+  margin:1.6rem 0 .5rem;
+  text-transform:uppercase;
+  letter-spacing:.04em;
+}
+
+/* ---------- tables ---------- */
+.table-wrap{overflow-x:auto;margin:1rem 0}
+table{width:100%;border-collapse:collapse;font-size:.9rem}
+th,td{text-align:left;padding:.55rem .7rem;border-bottom:1px solid var(--line);vertical-align:top}
+th{
+  font-family:"IBM Plex Mono",monospace;
+  color:var(--graphite);
+  font-weight:600;
+  font-size:.72rem;
+  text-transform:uppercase;
+  letter-spacing:.06em;
+}
+tr:last-child td{border-bottom:none}
+td code{white-space:nowrap}
+
+/* ---------- code ---------- */
+pre{
+  background:var(--code-bg);
+  color:var(--code-ink);
+  border-radius:6px;
+  padding:1rem 1.15rem;
+  overflow-x:auto;
+  font-size:.83rem;
+  line-height:1.55;
+  font-family:"IBM Plex Mono",monospace;
+  margin:.8rem 0 1.2rem;
+}
+pre code{background:none;padding:0;color:inherit;font-size:inherit}
+code{
+  background:var(--panel);
+  border:1px solid var(--line);
+  border-radius:4px;
+  padding:.08rem .35rem;
+  font-size:.85em;
+  font-family:"IBM Plex Mono",monospace;
+}
+
+/* ---------- callouts ---------- */
+.callout{
+  border-radius:6px;
+  padding:.95rem 1.15rem;
+  margin:1.1rem 0;
+  font-size:.92rem;
+  border-left:3px solid;
+}
+.callout b{
+  display:block;
+  font-family:"IBM Plex Mono",monospace;
+  font-size:.75rem;
+  text-transform:uppercase;
+  letter-spacing:.06em;
+  margin-bottom:.35rem;
+}
+.callout.warn{background:var(--warn-bg);border-color:var(--warn-line);color:var(--warn-ink)}
+.callout.ok{background:var(--ok-bg);border-color:var(--ok-ink);color:var(--ok-ink)}
+
+/* ---------- numbered step sequence (a real pipeline order) ---------- */
+.sequence{position:relative;margin:1.2rem 0 1.6rem;padding-left:2.6rem}
+.sequence::before{
+  content:"";
+  position:absolute;
+  left:1.05rem;top:.3rem;bottom:.3rem;
+  width:1px;
+  background:var(--line);
+}
+.step{position:relative;margin:0 0 1.5rem}
+.step:last-child{margin-bottom:0}
+.step-num{
+  position:absolute;
+  left:-2.6rem;top:0;
+  width:2.1rem;height:2.1rem;
+  border-radius:50%;
+  background:var(--paper);
+  border:1.5px solid var(--signal);
+  color:var(--signal);
+  font-family:"IBM Plex Mono",monospace;
+  font-weight:700;
+  font-size:.85rem;
+  display:flex;align-items:center;justify-content:center;
+}
+.step-body b{display:block;margin-bottom:.3rem;font-size:1rem}
+.step-body .muted{color:var(--graphite);font-size:.87rem;display:block;margin-top:.4rem}
+
+/* ---------- troubleshooting list ---------- */
+.checklist{list-style:none;padding:0;margin:1rem 0}
+.checklist li{
+  padding:.75rem 0 .75rem 1.85rem;
+  position:relative;
+  border-bottom:1px solid var(--line);
+  font-size:.94rem;
+}
+.checklist li:last-child{border-bottom:none}
+.checklist li::before{
+  content:"›";
+  position:absolute;left:0;top:.72rem;
+  color:var(--signal);
+  font-family:"IBM Plex Mono",monospace;
+  font-weight:700;
+}
+.checklist b{font-family:"IBM Plex Mono",monospace;font-size:.87rem}
+
+/* ---------- misc ---------- */
+ul.plain{padding-left:1.2rem;margin:1rem 0}
+ul.plain li{margin-bottom:.6rem;font-size:.95rem}
+.muted{color:var(--graphite)}
+footer{
+  margin-top:3.5rem;
+  padding-top:1.2rem;
+  border-top:1px solid var(--line);
+  font-family:"IBM Plex Mono",monospace;
+  font-size:.75rem;
+  color:var(--graphite);
+  letter-spacing:.02em;
+}
+</style>
+
+<div class="masthead">
+  <div class="eyebrow">NeuroLens &middot; Seizure Prediction Pipeline</div>
+  <h1>Execution Roadmap</h1>
+  <p class="lede">From raw CHB-MIT EDF files to paper-ready LaTeX tables and figures &mdash; what to run, in what order, and what to expect at each stage.</p>
+</div>
+
+<div class="callout warn">
+  <b>Before you start</b>
+  This roadmap assumes real CHB-MIT data and multi-hour runtime. Every script here has been mechanically verified end-to-end &mdash; shapes, gradients, subprocess wiring, JSON schema, plotting &mdash; against synthetic stand-in data, but never against the real dataset, which isn't present in this environment. Treat a first real run's model-quality numbers (sensitivity, AUC, etc.) as a first read, not a final result.
+</div>
+
+<h2><span class="stage-idx">0</span> Prerequisites</h2>
+<div class="table-wrap">
+<table>
+  <tr><th>Requirement</th><th>Notes</th></tr>
+  <tr><td>CHB-MIT Scalp EEG Database</td><td>From PhysioNet. Point <code>--data_dir</code> at the folder containing <code>chb01/</code>, <code>chb02/</code>, <code>chb03/</code>.</td></tr>
+  <tr><td>Python packages</td><td><code>torch</code>, <code>mne</code>, <code>numpy</code>, <code>scipy</code>, <code>scikit-learn</code>, <code>faiss-cpu</code> (or <code>faiss-gpu</code>), <code>matplotlib</code>, <code>psutil</code> (optional &mdash; enables RAM logging)</td></tr>
+  <tr><td>GPU</td><td>Strongly recommended for Phase A/B training. CPU-only works (verified in this session) but is roughly 10&ndash;30&times; slower.</td></tr>
+  <tr><td>Disk</td><td>A few GB for checkpoints + FAISS indices across ~17 LOSO folds (chb01: 7 seizures, chb02: 3, chb03: 7).</td></tr>
+</table>
+</div>
+
+<h2><span class="stage-idx">1</span> Sanity checks first</h2>
+<p class="muted">Minutes, not hours &mdash; catch configuration problems before committing GPU time.</p>
+
+<div class="sequence">
+  <div class="step">
+    <div class="step-num">1</div>
+    <div class="step-body">
+      <b>Smoke-test on one patient, one fold, a tiny model</b>
+<pre><code>python run_experiments.py --data_dir /path/to/chb-mit --output_dir runs/smoke \
+  --patients chb01 --max_folds_per_patient 1 --max_folds 1 \
+  --epochs_pretrain 1 --epochs_finetune 1 --d_model 16 --n_heads 2 --n_layers 1 \
+  --synthetic_duration_min 2 --synthetic_transition_start_min 1 --synthetic_n_trials 1 \
+  --device cpu</code></pre>
+      <span class="muted">Confirms EDF parsing, montage resolution, and all four stages work against your actual data files. Expect a few minutes total.</span>
+    </div>
+  </div>
+  <div class="step">
+    <div class="step-num">2</div>
+    <div class="step-body">
+      <b>Check the log and the JSON it produced</b>
+<pre><code>tail -f runs/smoke/experiment_run.log       # while it runs
+cat runs/smoke/statistical_summary.json     # after</code></pre>
+    </div>
+  </div>
+</div>
+
+<h2><span class="stage-idx">2</span> Full run</h2>
+
+<div class="sequence">
+  <div class="step">
+    <div class="step-num">3</div>
+    <div class="step-body">
+      <b>Launch the real experiment</b>
+<pre><code>python run_experiments.py \
+  --data_dir /path/to/chb-mit-scalp-eeg-database-1.0.0 \
+  --output_dir runs/exp1 \
+  --patients chb01 chb02 chb03 \
+  --device cuda \
+  --epochs_pretrain 10 --epochs_finetune 15 \
+  --batch_size 32 --num_workers 4 \
+  --mc_samples 30 \
+  --synthetic_duration_min 15 --synthetic_transition_start_min 10 --synthetic_n_trials 5</code></pre>
+      <span class="muted">Run under <code>nohup</code> / <code>tmux</code> / <code>screen</code> &mdash; this is a multi-hour job. Progress streams to stdout and to <code>runs/exp1/experiment_run.log</code> simultaneously.</span>
+    </div>
+  </div>
+  <div class="step">
+    <div class="step-num">4</div>
+    <div class="step-body">
+      <b>Generate paper artifacts once evaluation finishes</b>
+<pre><code>python generate_paper_artifacts.py \
+  --report_json runs/exp1/checkpoints/evaluation_report.json \
+  --output_dir runs/exp1/artifacts</code></pre>
+      <span class="muted">Produces <code>results_table.tex</code>, <code>faithfulness_table.tex</code>, <code>tas_vs_time_to_seizure.png</code>. Needs no GPU, torch, or mne &mdash; it can run on a laptop with just that one JSON file copied over.</span>
+    </div>
+  </div>
+</div>
+
+<h2><span class="stage-idx">3</span> Expected runtimes</h2>
+<div class="table-wrap">
+<table>
+  <tr><th>Stage</th><th>CPU (this session's hardware)</th><th>Single GPU (estimate)</th></tr>
+  <tr><td>0 &middot; synthetic sanity check</td><td>~1 min for 15 min @ 18ch<span class="muted"> &mdash; numpy-bound, not GPU-accelerated</span></td><td>same regardless of device</td></tr>
+  <tr><td>1 &middot; train.py, all 17 folds</td><td class="muted">not attempted at full scale &mdash; likely 1&ndash;2 days</td><td class="muted">order-of-magnitude: a few hours, dominated by MNE EDF loading/filtering + a full re-embedding pass per fold, not just backward-pass time</td></tr>
+  <tr><td>2 &middot; evaluate.py, all 17 folds</td><td class="muted">not attempted at full scale</td><td class="muted">tens of minutes to ~1&ndash;2 hours &mdash; MC-Dropout (30 samples/window) + PGD counterfactual search + several JR-NMM trials per fold add up</td></tr>
+  <tr><td>3 &middot; statistics + artifacts</td><td>seconds</td><td>seconds</td></tr>
+</table>
+</div>
+
+<div class="callout warn">
+  <b>Estimates, not measurements</b>
+  Only the tiny synthetic-data smoke test was actually timed in this session (~6 minutes end-to-end for 1 patient &times; 2 folds &times; a 16-dim toy model). The full-scale figures above are order-of-magnitude reasoning from that, not a benchmark on real CHB-MIT data or real GPU hardware. Time your own Stage 0 plus one fold of Stage 1/2 before committing to an unattended multi-hour run.
+</div>
+
+<h2><span class="stage-idx">4</span> GPU memory considerations</h2>
+<ul class="plain">
+  <li><b>The model itself is small</b> &mdash; ~0.7M params at the default architecture (<code>d_model=64</code>). Not the memory bottleneck.</li>
+  <li><b>MC-Dropout inference batches the replica dimension</b>: <code>get_mc_prediction(x, num_samples=30)</code> runs one forward pass on a batch replicated 30&times;. At <code>batch_size=32</code>, that's an effective batch of 960 &mdash; if evaluation OOMs, lower <code>--mc_samples</code> before <code>--batch_size</code>.</li>
+  <li><b>Counterfactual PGD</b> averages <code>mc_samples_grad</code> (default 5) differentiable forward passes per iteration, for up to 100 iterations, per faithfulness sample &mdash; the second-heaviest step in evaluation after MC inference.</li>
+  <li><b>FAISS index build</b> re-embeds the entire training set once at the end of each fold (a full extra pass) &mdash; budget for this in your Stage 1 time estimate, not just epochs &times; epoch time.</li>
+  <li><b>Starting point for an 8&ndash;12&nbsp;GB GPU</b>: default architecture, <code>--batch_size 32</code>, <code>--mc_samples 30</code>. Scale down <code>batch_size</code> first if you hit OOM.</li>
+</ul>
+
+<h2><span class="stage-idx">5</span> Troubleshooting</h2>
+<ul class="checklist">
+  <li><b>"No trajectories of length k could be built"</b> during FAISS export &mdash; that fold's training set has no contiguous run &ge; <code>--trajectory_k</code> (default 12) windows long. Try a smaller <code>--trajectory_k</code>, or check the patient has enough seizures for LOSO to leave meaningful preictal data behind.</li>
+  <li><b>Fold skipped, "produced an empty split"</b> &mdash; that LOSO fold's train/val/test partition came back empty (very sparse recording relative to the interictal/preictal window rules). Check <code>experiment_run.log</code> for which fold.</li>
+  <li><b>"validation set has a single class; skipping temperature scaling"</b> &mdash; expected and harmless on small/early folds; temperature defaults to 1.0 (no calibration correction) for that fold.</li>
+  <li><b><code>bifurcation: null</code></b> or a note about "no historical preictal trajectories" &mdash; that fold's training data had no preictal FAISS class (common for patients with very few seizures under LOSO). Not a crash; BPE just isn't computable for that fold.</li>
+  <li><b>CIs in <code>statistical_summary.json</code> look absurdly wide</b> &mdash; check <code>n</code> for that metric. At small fold counts the Student's-t critical value is large; this is mathematically correct, not a bug, and tightens as more folds succeed.</li>
+  <li><b>Resuming after a crash</b> &mdash; pass <code>--skip_training</code> to re-run Stage 2/3 against an existing <code>--output_dir/checkpoints</code> without repeating Stage 1.</li>
+</ul>
+
+<h2><span class="stage-idx">6</span> Output map</h2>
+<pre><code>runs/exp1/
+├── experiment_run.log            # full streamed log, all 4 stages
+├── run_config.json               # exact CLI args used
+├── synthetic_ground_truth.npz    # Stage 0 reference JR-NMM recording
+├── statistical_summary.json      # Stage 3: mean ± 95% CI per metric
+├── experiment_summary.json       # top-level pointers + timing
+├── checkpoints/
+│   ├── training_summary.json
+│   ├── &lt;patient&gt;_seizure&lt;i&gt;.pt              # one checkpoint per fold
+│   ├── &lt;patient&gt;_seizure&lt;i&gt;_faiss_index/     # one FAISS export per fold
+│   └── evaluation_report.json                # Stage 2 full report
+└── artifacts/
+    ├── results_table.tex
+    ├── faithfulness_table.tex
+    └── tas_vs_time_to_seizure.png</code></pre>
+
+<footer>NeuroLens &middot; run_experiments.py + generate_paper_artifacts.py</footer>

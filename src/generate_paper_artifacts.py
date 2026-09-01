@@ -1,0 +1,299 @@
+"""Generate publication-ready artifacts from a NeuroLens evaluate.py report.
+
+Ingests `evaluation_report.json` (as produced by evaluate.py / run_experiments.py)
+and writes:
+
+    1. results_table.tex          -- Sensitivity, FPR/h, AUC-ROC, AUPRC, and
+                                      Bifurcation Point Error (BPE), per
+                                      patient and pooled, mean +/- 95% CI.
+    2. faithfulness_table.tex     -- Counterfactual Steer Drop (%) and the
+                                      counterfactual-vs-random faithfulness
+                                      gain, per patient and pooled.
+    3. tas_vs_time_to_seizure.png -- TAS(t) on the synthetic Jansen-Rit
+                                      benchmark, x-axis = time to the (exact,
+                                      analytically-located) bifurcation
+                                      onset, with the Seizure Prediction
+                                      Horizon boundary and each detected
+                                      onset marked.
+
+This script only needs the JSON report plus numpy/scipy/matplotlib -- no
+torch/mne/faiss -- so it can run on a laptop after copying just that one
+file off wherever training/evaluation actually ran.
+
+Usage:
+    python generate_paper_artifacts.py --report_json runs/exp1/checkpoints/evaluation_report.json \
+        --output_dir runs/exp1/artifacts
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from collections import defaultdict
+from typing import Dict, List, Optional, Sequence
+
+import matplotlib
+
+matplotlib.use("Agg")  # headless-safe: no display or GUI backend required
+import matplotlib.pyplot as plt
+import numpy as np
+from scipy import stats
+
+
+# --------------------------------------------------------------------------
+# Statistics (self-contained duplicate of run_experiments.py's helper, so
+# this script has no dependency on it and can run standalone)
+# --------------------------------------------------------------------------
+
+
+def mean_confidence_interval(values: Sequence[Optional[float]], confidence: float = 0.95) -> Dict[str, Optional[float]]:
+    arr = np.asarray([v for v in values if v is not None and np.isfinite(v)], dtype=np.float64)
+    n = arr.size
+    if n == 0:
+        return {"mean": None, "half_width": None, "n": 0}
+    mean = float(arr.mean())
+    if n == 1:
+        return {"mean": mean, "half_width": None, "n": 1}
+    std = float(arr.std(ddof=1))
+    sem = std / np.sqrt(n)
+    t_crit = float(stats.t.ppf(0.5 + confidence / 2.0, df=n - 1))
+    return {"mean": mean, "half_width": t_crit * sem, "n": n}
+
+
+def _counterfactual_steer_drop_pct(fold_report: Dict) -> Optional[float]:
+    """% drop in predicted seizure probability after applying delta_z."""
+    fa = fold_report.get("faithfulness") or {}
+    initial = fa.get("mean_initial_risk")
+    final = fa.get("mean_counterfactual_final_risk")
+    if initial is None or final is None or initial <= 0:
+        return None
+    return 100.0 * (initial - final) / initial
+
+
+def _group_by_patient(report: Dict) -> Dict[str, List[Dict]]:
+    by_patient: Dict[str, List[Dict]] = defaultdict(list)
+    for f in report.get("folds", []):
+        by_patient[f["patient_id"]].append(f)
+    return dict(sorted(by_patient.items()))
+
+
+def _fmt(stat: Dict, scale: float = 1.0, decimals: int = 3) -> str:
+    if stat["mean"] is None:
+        return "N/A"
+    mean = stat["mean"] * scale
+    if stat["half_width"] is None:  # single-fold: no CI is defined
+        return f"{mean:.{decimals}f}"
+    hw = stat["half_width"] * scale
+    return f"{mean:.{decimals}f} $\\pm$ {hw:.{decimals}f}"
+
+
+def _escape_latex(text: str) -> str:
+    return text.replace("_", "\\_")
+
+
+# --------------------------------------------------------------------------
+# 1. Results table: Sensitivity, FPR/h, AUC-ROC, AUPRC, BPE
+# --------------------------------------------------------------------------
+
+
+def build_latex_table(report: Dict, output_path: str) -> str:
+    by_patient = _group_by_patient(report)
+    all_folds = report.get("folds", [])
+
+    def _row(label: str, fold_list: List[Dict]) -> str:
+        sens = mean_confidence_interval([f["clinical"]["sensitivity_window"] for f in fold_list])
+        fpr = mean_confidence_interval([f["clinical"]["fpr_per_hour_event"] for f in fold_list])
+        auc = mean_confidence_interval([f["clinical"]["auc_roc"] for f in fold_list])
+        auprc = mean_confidence_interval([f["clinical"]["auprc"] for f in fold_list])
+        bpe = mean_confidence_interval([(f.get("bifurcation") or {}).get("mean_abs_bpe_sec") for f in fold_list])
+        return (
+            f"{_escape_latex(label)} & {_fmt(sens, scale=100.0, decimals=1)} & {_fmt(fpr, decimals=3)} & "
+            f"{_fmt(auc, decimals=3)} & {_fmt(auprc, decimals=3)} & {_fmt(bpe, decimals=2)} \\\\"
+        )
+
+    lines = [
+        "% Auto-generated by generate_paper_artifacts.py -- do not edit by hand.",
+        "\\begin{table}[t]",
+        "\\centering",
+        "\\caption{Seizure prediction performance across CHB-MIT patients (Leave-One-Seizure-Out "
+        "cross-validation), reported as mean $\\pm$ 95\\% CI over folds. FPR/h is the event-level "
+        "(refractory-debounced) false prediction rate per hour of interictal recording. BPE is the "
+        "Bifurcation Point Error (seconds) on synthetic Jansen-Rit ground-truth data.}",
+        "\\label{tab:neurolens_results}",
+        "\\begin{tabular}{lccccc}",
+        "\\toprule",
+        "Patient & Sensitivity (\\%) & FPR/h & AUC-ROC & AUPRC & BPE (s) \\\\",
+        "\\midrule",
+    ]
+    for patient_id, fold_list in by_patient.items():
+        lines.append(_row(f"{patient_id} (n={len(fold_list)})", fold_list))
+    lines.append("\\midrule")
+    lines.append(_row(f"Overall (n={len(all_folds)})", all_folds))
+    lines += ["\\bottomrule", "\\end{tabular}", "\\end{table}"]
+
+    latex = "\n".join(lines)
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(latex + "\n")
+    return latex
+
+
+# --------------------------------------------------------------------------
+# 2. XAI faithfulness table: Counterfactual Steer Drop + faithfulness gain
+# --------------------------------------------------------------------------
+
+
+def build_faithfulness_table(report: Dict, output_path: str) -> str:
+    by_patient = _group_by_patient(report)
+    all_folds = report.get("folds", [])
+
+    def _row(label: str, fold_list: List[Dict]) -> str:
+        steer = mean_confidence_interval([_counterfactual_steer_drop_pct(f) for f in fold_list])
+        gain = mean_confidence_interval([(f.get("faithfulness") or {}).get("mean_faithfulness_gain") for f in fold_list])
+        p_values = [
+            (f.get("faithfulness") or {}).get("wilcoxon_p_value")
+            for f in fold_list
+            if (f.get("faithfulness") or {}).get("wilcoxon_p_value") is not None
+        ]
+        frac_sig_str = f"{100.0 * sum(1 for p in p_values if p < 0.05) / len(p_values):.0f}\\%" if p_values else "N/A"
+        return f"{_escape_latex(label)} & {_fmt(steer, decimals=1)} & {_fmt(gain, decimals=4)} & {frac_sig_str} \\\\"
+
+    lines = [
+        "% Auto-generated by generate_paper_artifacts.py -- do not edit by hand.",
+        "\\begin{table}[t]",
+        "\\centering",
+        "\\caption{Counterfactual latent-steering faithfulness: risk reduction from the computed "
+        "counterfactual $\\delta z$ versus a magnitude-matched random Gaussian perturbation, mean "
+        "$\\pm$ 95\\% CI over LOSO folds. Steer Drop is the percentage drop in MC-Dropout-averaged "
+        "predicted seizure probability after applying $\\delta z$; Faithfulness Gain is the risk "
+        "reduction advantage of $\\delta z$ over matched-magnitude random noise; the last column is "
+        "the fraction of folds where this advantage was significant (paired Wilcoxon $p<0.05$).}",
+        "\\label{tab:neurolens_faithfulness}",
+        "\\begin{tabular}{lccc}",
+        "\\toprule",
+        "Patient & Steer Drop (\\%) & Faithfulness Gain & Folds $p<0.05$ \\\\",
+        "\\midrule",
+    ]
+    for patient_id, fold_list in by_patient.items():
+        lines.append(_row(f"{patient_id} (n={len(fold_list)})", fold_list))
+    lines.append("\\midrule")
+    lines.append(_row(f"Overall (n={len(all_folds)})", all_folds))
+    lines += ["\\bottomrule", "\\end{tabular}", "\\end{table}"]
+
+    latex = "\n".join(lines)
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(latex + "\n")
+    return latex
+
+
+# --------------------------------------------------------------------------
+# 3. TAS vs. Time-to-Seizure plot
+# --------------------------------------------------------------------------
+
+
+def plot_tas_vs_time_to_seizure(report: Dict, output_path: str, max_curves: Optional[int] = None) -> None:
+    entries = []
+    for f in report.get("folds", []):
+        bif = f.get("bifurcation")
+        if not bif:
+            continue
+        sph_sec = bif.get("sph_sec")
+        for trial in bif.get("trials", []):
+            tas_times = trial.get("tas_times_sec")
+            tas_series = trial.get("tas_series")
+            true_onset = trial.get("true_bifurcation_onset_sec")
+            if not tas_times or not tas_series or true_onset is None:
+                continue
+            entries.append(
+                {
+                    "fold_id": f["fold_id"],
+                    "trial": trial["trial"],
+                    "t": np.asarray(tas_times, dtype=np.float64) - true_onset,
+                    "y": np.asarray(tas_series, dtype=np.float64),
+                    "detected_onset_sec": trial.get("detected_onset_sec"),
+                    "true_onset": true_onset,
+                    "sph_sec": sph_sec,
+                }
+            )
+
+    if not entries:
+        raise ValueError(
+            "No TAS(t) curves found in this report's bifurcation results. Either "
+            "--no_bifurcation_benchmark was passed to evaluate.py, or every fold hit the "
+            "'no historical preictal trajectories in this fold's FAISS index' fallback "
+            "(check for that note in evaluation_report.json's folds[*].bifurcation.trials)."
+        )
+
+    if max_curves is not None:
+        entries = entries[:max_curves]
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    cmap = plt.get_cmap("tab10")
+    sph_sec = next((e["sph_sec"] for e in entries if e["sph_sec"] is not None), 300.0)
+
+    for i, e in enumerate(entries):
+        color = cmap(i % 10)
+        ax.plot(e["t"], e["y"], color=color, alpha=0.85, linewidth=1.5, label=f"{e['fold_id']} (trial {e['trial']})")
+        if e["detected_onset_sec"] is not None:
+            t_detect = e["detected_onset_sec"] - e["true_onset"]
+            ax.axvline(t_detect, color=color, linestyle=":", linewidth=1.2, alpha=0.8)
+
+    ax.axvline(0.0, color="black", linestyle="-", linewidth=1.5, label="Bifurcation onset ($t=0$)")
+    ax.axvline(-sph_sec, color="crimson", linestyle="--", linewidth=1.5, label=f"SPH boundary ($-{sph_sec / 60:.0f}$ min)")
+    ax.axvspan(-sph_sec, 0.0, color="crimson", alpha=0.08, label="Excluded SPH window")
+
+    ax.set_xlabel("Time to Seizure / Bifurcation Onset (s)")
+    ax.set_ylabel("Trajectory Alignment Score (TAS) vs. historical preictal trajectories")
+    ax.set_title("TAS(t) on Synthetic Jansen-Rit Ground Truth vs. Time to Seizure")
+    ax.legend(loc="best", fontsize=8, framealpha=0.9)
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--report_json", type=str, required=True, help="Path to evaluate.py's evaluation_report.json")
+    p.add_argument("--output_dir", type=str, default="artifacts")
+    p.add_argument("--table_filename", type=str, default="results_table.tex")
+    p.add_argument("--faithfulness_table_filename", type=str, default="faithfulness_table.tex")
+    p.add_argument("--plot_filename", type=str, default="tas_vs_time_to_seizure.png")
+    p.add_argument("--max_curves_plotted", type=int, default=None, help="Cap the number of fold/trial curves drawn on the TAS plot.")
+    return p
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = _build_arg_parser().parse_args(argv)
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    with open(args.report_json) as f:
+        report = json.load(f)
+
+    table_path = os.path.join(args.output_dir, args.table_filename)
+    latex = build_latex_table(report, table_path)
+    print(f"Wrote LaTeX results table: {table_path}\n")
+    print(latex)
+
+    xai_table_path = os.path.join(args.output_dir, args.faithfulness_table_filename)
+    xai_latex = build_faithfulness_table(report, xai_table_path)
+    print(f"\nWrote LaTeX XAI-faithfulness table: {xai_table_path}\n")
+    print(xai_latex)
+
+    plot_path = os.path.join(args.output_dir, args.plot_filename)
+    try:
+        plot_tas_vs_time_to_seizure(report, plot_path, args.max_curves_plotted)
+        print(f"\nWrote TAS-vs-time-to-seizure plot: {plot_path}")
+    except ValueError as exc:
+        print(f"\nSkipped TAS plot: {exc}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
