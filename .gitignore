@@ -22,6 +22,10 @@ ENV/
 .idea/
 *.swp
 
+# --- Local AI-assistant config/notes (never published) ---
+CLAUDE.md
+.claude/
+
 # --- OS ---
 .DS_Store
 Thumbs.db
