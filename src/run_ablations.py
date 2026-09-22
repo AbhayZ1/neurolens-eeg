@@ -307,6 +307,40 @@ def train_baseline_fold(
     )
 
 
+def _load_baseline_fold(
+    ckpt_path: str, patient_id: str, test_seizure_idx: int, config: AblationConfig, device: torch.device, log: logging.Logger
+) -> BaselineFoldResult:
+    """Reconstruct a BaselineFoldResult from an already-trained checkpoint
+    instead of retraining -- used to resume after a Kaggle session timeout.
+    Loaders are cheap to rebuild (no GPU work); only the weight training
+    itself is skipped.
+    """
+    train_loader, val_loader, test_loader = get_loso_splits(
+        patient_id,
+        config.data_dir,
+        test_seizure_idx,
+        batch_size=config.batch_size,
+        val_fraction=config.val_fraction,
+        num_workers=config.num_workers,
+        raw_cache_size=config.raw_cache_size,
+    )
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    model = _build_baseline_model(config)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model = model.to(device)
+    log.info(f"[baseline {patient_id} fold{test_seizure_idx}] loaded existing checkpoint {ckpt_path}, skipping retraining")
+    return BaselineFoldResult(
+        patient_id=patient_id,
+        test_seizure_idx=test_seizure_idx,
+        model=model,
+        best_val_auprc=ckpt.get("val_auprc", float("nan")),
+        train_loader=train_loader,
+        val_loader=val_loader,
+        test_loader=test_loader,
+        history=ckpt.get("history", []),
+    )
+
+
 # --------------------------------------------------------------------------
 # Phase 2: baseline evaluation
 # --------------------------------------------------------------------------
@@ -410,12 +444,15 @@ def run_neurolens_robustness(
     ]
     try:
         _stream_subprocess(cmd, log, f"artifact_robustness[neurolens:{fold_id}]")
-    except RuntimeError as exc:
-        log.warning(f"[robustness] artifact_robustness.py failed for NeuroLens fold {fold_id}: {exc}")
+        with open(out_json) as f:
+            return json.load(f)
+    except Exception as exc:
+        # Broad on purpose: a launch failure, a malformed/missing output
+        # file, or any other surprise here must not abort the whole
+        # ablation run -- this fold's NeuroLens robustness data is simply
+        # unavailable for the comparison table.
+        log.exception(f"[robustness] artifact_robustness.py failed for NeuroLens fold {fold_id}: {exc}")
         return None
-
-    with open(out_json) as f:
-        return json.load(f)
 
 
 @torch.no_grad()
@@ -440,23 +477,26 @@ def run_baseline_robustness(
     contamination realization's effect on its raw sigmoid risk instead,
     reusing artifact_robustness.py's model-agnostic signal utilities.
     """
-    cache_key = (patient_id, min_windows)
-    if cache_key not in _CLEAN_SIGNAL_CACHE:
-        try:
+    try:
+        cache_key = (patient_id, min_windows)
+        if cache_key not in _CLEAN_SIGNAL_CACHE:
             clean_signal, _run_windows = find_clean_interictal_run(patient_id, config.data_dir, min_windows)
-        except RuntimeError as exc:
-            log.warning(f"[robustness] no clean interictal run for {patient_id}: {exc}")
-            return None
-        _CLEAN_SIGNAL_CACHE[cache_key] = (clean_signal, clean_signal.shape[1])
-    clean_signal, _ = _CLEAN_SIGNAL_CACHE[cache_key]
+            _CLEAN_SIGNAL_CACHE[cache_key] = (clean_signal, clean_signal.shape[1])
+        clean_signal, _ = _CLEAN_SIGNAL_CACHE[cache_key]
 
-    inj_config = ArtifactInjectionConfig()
-    clean_windows = windowize_signal(clean_signal)
-    clean_risks = _baseline_risk(model, clean_windows, device)
+        inj_config = ArtifactInjectionConfig()
+        clean_windows = windowize_signal(clean_signal)
+        clean_risks = _baseline_risk(model, clean_windows, device)
 
-    cs = generate_contaminated_signal(clean_signal, float(FS), inj_config, config.worst_case_severity, seed=config.robustness_seed)
-    contaminated_windows = windowize_signal(cs.contaminated)
-    contaminated_risks = _baseline_risk(model, contaminated_windows, device)
+        cs = generate_contaminated_signal(clean_signal, float(FS), inj_config, config.worst_case_severity, seed=config.robustness_seed)
+        contaminated_windows = windowize_signal(cs.contaminated)
+        contaminated_risks = _baseline_risk(model, contaminated_windows, device)
+    except Exception as exc:
+        # Broad on purpose (see run_neurolens_robustness): no clean run, a
+        # filter-stability hiccup, or any other surprise here must not
+        # abort the whole ablation run.
+        log.exception(f"[robustness] baseline robustness check failed for {patient_id}: {exc}")
+        return None
 
     n_fp_clean = int(np.sum(clean_risks > config.decision_threshold))
     n_fp_contaminated = int(np.sum(contaminated_risks > config.decision_threshold))
@@ -664,6 +704,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--neurolens_checkpoint_dir", type=str, default=None,
         help="Defaults to <output_dir>/checkpoints (where run_experiments.py/train.py/evaluate.py wrote NeuroLens's results).",
     )
+    p.add_argument(
+        "--force_retrain",
+        action="store_true",
+        help=(
+            "Retrain every baseline fold even if a checkpoint for it already exists in "
+            "<output_dir>/baseline_checkpoints. Default (off) resumes: an already-checkpointed "
+            "fold's weights are reloaded instead of retrained -- safe to re-run this exact "
+            "command after a Kaggle session timeout."
+        ),
+    )
     return p
 
 
@@ -744,31 +794,49 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     for entry in neurolens_folds_meta:
         patient_id, test_seizure_idx, fold_id = entry["patient_id"], entry["test_seizure_idx"], entry["fold_id"]
+        ckpt_path = os.path.join(baseline_ckpt_dir, f"{fold_id}.pt")
+        resumed = not args.force_retrain and os.path.isfile(ckpt_path)
 
-        log.info(f"=== Phase 1: training baseline for fold {fold_id} ===")
         try:
-            result = train_baseline_fold(patient_id, test_seizure_idx, config, device, log)
-        except RuntimeError as exc:
-            log.warning(f"Skipping baseline fold {fold_id}: {exc}")
+            if resumed:
+                result = _load_baseline_fold(ckpt_path, patient_id, test_seizure_idx, config, device, log)
+            else:
+                log.info(f"=== Phase 1: training baseline for fold {fold_id} ===")
+                result = train_baseline_fold(patient_id, test_seizure_idx, config, device, log)
+        except Exception as exc:
+            # Broad on purpose: one anomalous fold (corrupt EDF, a linear-
+            # algebra singularity, CUDA OOM, ...) must never take down an
+            # unattended multi-hour Kaggle run.
+            log.exception(f"Skipping baseline fold {fold_id} (unexpected error in Phase 1: {exc})")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             continue
 
-        ckpt_path = os.path.join(baseline_ckpt_dir, f"{fold_id}.pt")
-        torch.save(
-            {
-                "model_state_dict": result.model.state_dict(),
-                "model_kwargs": _baseline_model_kwargs(config),
-                "val_auprc": result.best_val_auprc,
-                "patient_id": patient_id,
-                "test_seizure_idx": test_seizure_idx,
-                "history": result.history,
-            },
-            ckpt_path,
-        )
-        log.info(f"Saved baseline checkpoint: {ckpt_path} (val_auprc={result.best_val_auprc:.4f})")
+        if not resumed:
+            cpu_state_dict = {k: v.detach().cpu() for k, v in result.model.state_dict().items()}
+            torch.save(
+                {
+                    "model_state_dict": cpu_state_dict,
+                    "model_kwargs": _baseline_model_kwargs(config),
+                    "val_auprc": result.best_val_auprc,
+                    "patient_id": patient_id,
+                    "test_seizure_idx": test_seizure_idx,
+                    "history": result.history,
+                },
+                ckpt_path,
+            )
+            log.info(f"Saved baseline checkpoint: {ckpt_path} (val_auprc={result.best_val_auprc:.4f})")
 
         log.info(f"=== Phase 2: evaluating baseline for fold {fold_id} ===")
-        eval_entry = evaluate_baseline_fold(result.model, patient_id, test_seizure_idx, result.test_loader, config, device, log)
-        baseline_eval_folds.append(eval_entry)
+        try:
+            eval_entry = evaluate_baseline_fold(result.model, patient_id, test_seizure_idx, result.test_loader, config, device, log)
+            baseline_eval_folds.append(eval_entry)
+        except Exception as exc:
+            # The checkpoint above is already safely on disk even if
+            # evaluation itself fails; just skip this fold's comparison data.
+            log.exception(f"Phase 2 evaluation failed for baseline fold {fold_id}: {exc}")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         baseline_training_summary.append(
             {
@@ -787,12 +855,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         k = _read_faiss_k(faiss_dir) if faiss_dir else None
         fold_faiss_k_cache[fold_id] = k if k is not None else 12
 
-    with open(os.path.join(baseline_ckpt_dir, "baseline_training_summary.json"), "w") as f:
-        json.dump({"config": asdict(config), "folds": baseline_training_summary}, f, indent=2)
+        # Written after every fold, not just once at the end: a Kaggle GPU
+        # session killed mid-loop by the runtime cap must not lose folds
+        # that already finished training+eval in this session.
+        with open(os.path.join(baseline_ckpt_dir, "baseline_training_summary.json"), "w") as f:
+            json.dump({"config": asdict(config), "folds": baseline_training_summary}, f, indent=2)
+        with open(os.path.join(baseline_ckpt_dir, "baseline_evaluation_report.json"), "w") as f:
+            json.dump({"folds": baseline_eval_folds}, f, indent=2)
 
-    baseline_eval_report_path = os.path.join(baseline_ckpt_dir, "baseline_evaluation_report.json")
-    with open(baseline_eval_report_path, "w") as f:
-        json.dump({"folds": baseline_eval_folds}, f, indent=2)
     log.info(f"Phase 1+2 complete: {len(baseline_eval_folds)}/{len(neurolens_folds_meta)} baseline fold(s) trained and evaluated")
 
     # ---- Phase 3: robustness ---------------------------------------------
@@ -810,13 +880,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             min_windows = config.robustness_min_windows or (fold_faiss_k_cache[fold_id] + 24)
 
             log.info(f"=== Phase 3: robustness @ severity={config.worst_case_severity:g} for fold {fold_id} ===")
-            nl_report = run_neurolens_robustness(patient_id, entry, min_windows, config, log)
-            if nl_report is not None:
-                neurolens_robustness_by_fold[fold_id] = nl_report
+            try:
+                # run_neurolens_robustness / run_baseline_robustness already
+                # catch their own internal failures and return None; this
+                # outer try/except is a defense-in-depth safety net so that
+                # nothing in Phase 3 can ever abort the whole ablation run.
+                nl_report = run_neurolens_robustness(patient_id, entry, min_windows, config, log)
+                if nl_report is not None:
+                    neurolens_robustness_by_fold[fold_id] = nl_report
 
-            bl_report = run_baseline_robustness(fold_model_cache[fold_id], patient_id, min_windows, config, device, log)
-            if bl_report is not None:
-                baseline_robustness_by_fold[fold_id] = bl_report
+                bl_report = run_baseline_robustness(fold_model_cache[fold_id], patient_id, min_windows, config, device, log)
+                if bl_report is not None:
+                    baseline_robustness_by_fold[fold_id] = bl_report
+            except Exception as exc:
+                log.exception(f"Phase 3 robustness check failed unexpectedly for fold {fold_id}: {exc}")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
 
     with open(os.path.join(ablation_dir, "robustness_comparison.json"), "w") as f:
         json.dump(

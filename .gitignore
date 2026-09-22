@@ -52,3 +52,7 @@ baseline_checkpoints/
 
 # --- Scratch / temp ---
 *.tmp
+
+# --- graphify (local knowledge-graph tooling output, regenerated on demand) ---
+graphify-out/
+.gitattributes

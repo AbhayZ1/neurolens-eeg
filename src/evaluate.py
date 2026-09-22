@@ -116,7 +116,7 @@ def run_mc_inference(
     model: NeuroLensBackbone, loader: DataLoader, device: torch.device, num_samples: int, temperature: float
 ) -> Dict[str, np.ndarray]:
     model.eval()
-    probs_raw, probs_cal, labels, timestamps, entropy, mc_std = [], [], [], [], [], []
+    probs_raw, probs_cal, labels, timestamps, entropy, mc_std, latents = [], [], [], [], [], [], []
     for x, y, ts in loader:
         x = x.to(device)
         mc = model.get_mc_prediction(x, num_samples=num_samples)
@@ -130,6 +130,12 @@ def run_mc_inference(
         timestamps.append(ts.numpy())
         entropy.append(mc["predictive_entropy"].cpu().numpy())
         mc_std.append(mc["mc_std"].cpu().numpy())
+        # A single stochastic forward pass's latent vector, kept for
+        # generate_paper_artifacts.py's 2D latent-trajectory map (Fig. 1) --
+        # a representative embedding per window is enough for that
+        # visualization; it is not used for any uncertainty-sensitive metric.
+        with torch.no_grad():
+            latents.append(model(x)["latent_vector"].cpu().numpy())
 
     return {
         "probs_raw": np.concatenate(probs_raw),
@@ -138,6 +144,7 @@ def run_mc_inference(
         "timestamps": np.concatenate(timestamps),
         "predictive_entropy": np.concatenate(entropy),
         "mc_std": np.concatenate(mc_std),
+        "latent_vectors": np.concatenate(latents),
     }
 
 
@@ -293,12 +300,16 @@ def faithfulness_benchmark(
     top_idx = torch.argsort(probs_cat, descending=True)[:n_use]
 
     initial_risks, cf_final_risks, random_mean_risks, delta_norms = [], [], [], []
+    delta_tangents = []
     for idx in top_idx.tolist():
         x_win = x_cat[idx : idx + 1].to(device)
         with torch.no_grad():
             z0 = model(x_win)["latent_vector"][0]
+        # raw_window enables the exact VJP pullback to tangent space (see
+        # CounterfactualSteeringEngine._pullback_delta_to_tangent), which is
+        # what makes the channel-level attribution below possible.
         result = cf_engine.compute_counterfactual_perturbation(
-            model, z0, target_risk=target_risk, lr=pgd_lr, max_iter=pgd_max_iter
+            model, z0, target_risk=target_risk, lr=pgd_lr, max_iter=pgd_max_iter, raw_window=x_win[0]
         )
         random_risk = _matched_random_perturbation_risk(model, z0, result.delta_z, n_random_repeats)
 
@@ -306,6 +317,8 @@ def faithfulness_benchmark(
         cf_final_risks.append(result.final_risk.item())
         random_mean_risks.append(random_risk.item())
         delta_norms.append(result.delta_z.norm().item())
+        if result.delta_tangent is not None:
+            delta_tangents.append(result.delta_tangent.squeeze(0).detach().cpu().numpy())
 
     cf_arr = np.array(cf_final_risks)
     rand_arr = np.array(random_mean_risks)
@@ -318,6 +331,22 @@ def faithfulness_benchmark(
         except ValueError:
             p_value = None
 
+    channel_attribution = None
+    if delta_tangents:
+        mean_delta_tangent = torch.from_numpy(np.mean(delta_tangents, axis=0)).float()
+        try:
+            proj = cf_engine.project_perturbation_to_channels(model.encoder.tangent_projector, mean_delta_tangent)
+            channel_attribution = {
+                "channel_power_delta": proj["channel_power_delta"],
+                "region_delta": proj["region_delta"],
+                "top_channel_pairs": [[a, b, float(v)] for a, b, v in proj["top_channel_pairs"]],
+                "dominant_region": proj["dominant_region"],
+                "dominant_direction": proj["dominant_direction"],
+                "narrative": proj["narrative"],
+            }
+        except ValueError:
+            channel_attribution = None
+
     return {
         "n_samples": int(n_use),
         "target_risk": target_risk,
@@ -328,6 +357,11 @@ def faithfulness_benchmark(
         "std_faithfulness_gain": float(gains.std()),
         "mean_delta_z_norm": float(np.mean(delta_norms)),
         "wilcoxon_p_value": p_value,
+        # Mean tangent-space delta over the sampled high-risk windows,
+        # projected onto the 18-channel bipolar montage: which channels'
+        # power/synchrony the counterfactual steering leans on most, for
+        # generate_paper_artifacts.py's channel-level heatmap (Fig. 5).
+        "channel_attribution": channel_attribution,
     }
 
 
@@ -531,17 +565,23 @@ def evaluate_fold(
     uncertainty_calibrated = uncertainty_metrics(mc["probs_calibrated"], mc["labels"], config.n_calibration_bins)
 
     cf_engine = CounterfactualSteeringEngine(mc_samples_grad=config.cf_mc_samples_grad)
-    faithfulness = faithfulness_benchmark(
-        model,
-        cf_engine,
-        test_loader,
-        device,
-        n_samples=config.faithfulness_n_samples,
-        target_risk=config.faithfulness_target_risk,
-        n_random_repeats=config.faithfulness_random_repeats,
-        pgd_lr=config.faithfulness_pgd_lr,
-        pgd_max_iter=config.faithfulness_pgd_max_iter,
-    )
+    try:
+        faithfulness = faithfulness_benchmark(
+            model,
+            cf_engine,
+            test_loader,
+            device,
+            n_samples=config.faithfulness_n_samples,
+            target_risk=config.faithfulness_target_risk,
+            n_random_repeats=config.faithfulness_random_repeats,
+            pgd_lr=config.faithfulness_pgd_lr,
+            pgd_max_iter=config.faithfulness_pgd_max_iter,
+        )
+    except Exception as exc:
+        # A PGD/numerical hiccup here must not cost this fold's otherwise-
+        # fine clinical and calibration metrics, computed above.
+        log.exception(f"Faithfulness benchmark failed for fold {fold_id}: {exc}")
+        faithfulness = {"n_samples": 0, "error": str(exc)}
 
     bifurcation = None
     if config.run_bifurcation_benchmark:
@@ -564,7 +604,7 @@ def evaluate_fold(
                     min_sustain_windows=config.min_sustain_windows,
                 )
             except Exception as exc:
-                log.warning(f"Bifurcation benchmark failed for fold {fold_id}: {exc}")
+                log.exception(f"Bifurcation benchmark failed for fold {fold_id}: {exc}")
 
     report = {
         "fold_id": fold_id,
@@ -578,12 +618,21 @@ def evaluate_fold(
         "uncertainty_calibrated": uncertainty_calibrated,
         "faithfulness": faithfulness,
         "bifurcation": bifurcation,
-        # Per-window predictions, kept (not just the summary "clinical"
-        # stats above) so a downstream consumer -- e.g. run_ablations.py's
-        # ROC comparison plot -- can rebuild a full ROC/PR curve without
+        # Path to this fold's exported FAISS trajectory index (from
+        # training_summary.json), so a downstream consumer can load its raw
+        # trajectories.npy/labels.npy directly (no faiss import needed) for
+        # generate_paper_artifacts.py's latent-trajectory map (Fig. 1).
+        "faiss_index_dir": fold_entry.get("faiss_index_dir"),
+        # Per-window predictions and latent embeddings, kept (not just the
+        # summary "clinical"/"uncertainty" stats above) so a downstream
+        # consumer -- e.g. run_ablations.py's ROC plot, or
+        # generate_paper_artifacts.py's latent-trajectory map -- can rebuild
+        # a full ROC/PR curve or a live-trajectory overlay without
         # re-running MC-Dropout inference.
         "probs_calibrated": mc["probs_calibrated"].tolist(),
         "labels": mc["labels"].tolist(),
+        "timestamps": mc["timestamps"].tolist(),
+        "latent_vectors": mc["latent_vectors"].tolist(),
     }
     raw = {"probs_calibrated": mc["probs_calibrated"], "probs_raw": mc["probs_raw"], "labels": mc["labels"]}
     return report, raw
@@ -594,6 +643,7 @@ def aggregate_reports(fold_reports: List[Dict], raw_arrays: List[Dict[str, np.nd
         return {}
 
     pooled_probs = np.concatenate([r["probs_calibrated"] for r in raw_arrays])
+    pooled_probs_raw = np.concatenate([r["probs_raw"] for r in raw_arrays])
     pooled_labels = np.concatenate([r["labels"] for r in raw_arrays])
 
     pooled_clinical = None
@@ -602,6 +652,10 @@ def aggregate_reports(fold_reports: List[Dict], raw_arrays: List[Dict[str, np.nd
             "auc_roc": float(roc_auc_score(pooled_labels, pooled_probs)),
             "auprc": float(average_precision_score(pooled_labels, pooled_probs)),
         }
+    # Both pre- (raw) and post-temperature-scaling (calibrated) pooled
+    # reliability curves, for generate_paper_artifacts.py's calibration
+    # comparison figure (Fig. 4).
+    pooled_uncertainty_raw = uncertainty_metrics(pooled_probs_raw, pooled_labels, config.n_calibration_bins)
     pooled_uncertainty = uncertainty_metrics(pooled_probs, pooled_labels, config.n_calibration_bins)
 
     event_caught = [f["clinical"]["confusion_matrix"]["tp"] > 0 for f in fold_reports]
@@ -624,6 +678,7 @@ def aggregate_reports(fold_reports: List[Dict], raw_arrays: List[Dict[str, np.nd
         "mean_fpr_per_hour_event": float(np.mean(fpr_event_vals)) if fpr_event_vals else None,
         "pooled_clinical": pooled_clinical,
         "pooled_uncertainty": pooled_uncertainty,
+        "pooled_uncertainty_raw": pooled_uncertainty_raw,
         "mean_faithfulness_gain": float(np.mean(faithfulness_gains)) if faithfulness_gains else None,
         "std_faithfulness_gain": float(np.std(faithfulness_gains)) if faithfulness_gains else None,
         "mean_abs_bpe_sec_across_folds": float(np.mean(bpe_vals)) if bpe_vals else None,
@@ -718,7 +773,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         try:
             report, raw = evaluate_fold(fold_entry, config, device, log)
         except Exception as exc:
-            log.error(f"Failed to evaluate fold {fold_entry.get('fold_id')}: {exc}")
+            log.exception(f"Failed to evaluate fold {fold_entry.get('fold_id')}: {exc}")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             continue
         fold_reports.append(report)
         raw_arrays.append(raw)

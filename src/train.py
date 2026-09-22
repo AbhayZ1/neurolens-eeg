@@ -135,6 +135,19 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def _dir_size_bytes(path: str) -> int:
+    """Recursive directory size, for disk-budget logging on space-constrained
+    hosts (e.g. Kaggle's 20 GB working disk)."""
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass  # file vanished mid-walk or is inaccessible; skip rather than crash
+    return total
+
+
 def resolve_device(name: str) -> torch.device:
     if name == "cuda":
         if not torch.cuda.is_available():
@@ -535,7 +548,55 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Cap the number of LOSO folds trained per patient (useful for smoke tests).",
     )
+    p.add_argument(
+        "--force_retrain",
+        action="store_true",
+        help=(
+            "Retrain every fold even if a checkpoint for it already exists in --output_dir. "
+            "Default (off) resumes: a fold whose <fold_id>.pt is already on disk is skipped and "
+            "its summary entry is reconstructed from that checkpoint -- safe to re-run this exact "
+            "command after a Kaggle session timeout without losing already-trained folds or "
+            "wasting GPU time redoing them."
+        ),
+    )
     return p
+
+
+def _write_training_summary(summary_path: str, config: "TrainConfig", folds: List[Dict]) -> None:
+    """Write training_summary.json after every fold, not just at the end.
+
+    A Kaggle GPU session can be killed by the runtime cap mid-run; if this
+    were only written once after the whole patient/fold loop finishes, a
+    kill mid-loop would leave *no* summary file at all even though several
+    folds' checkpoints are already safely on disk -- run_experiments.py's
+    Stage 2 hard-requires this file to exist, so that would silently lose
+    every fold trained in that session. Writing it after each fold means a
+    killed session always leaves a valid, current summary behind.
+    """
+    with open(summary_path, "w") as f:
+        json.dump({"config": asdict(config), "folds": folds}, f, indent=2)
+
+
+def _reload_fold_summary_entry(fold_id: str, patient_id: str, test_seizure_idx: int, ckpt_path: str) -> Dict:
+    """Reconstruct a training_summary.json fold entry from an already-saved
+    checkpoint, so a resumed run can skip re-training a fold and still
+    produce a complete summary. See --force_retrain / the skip check in
+    main() for where this is used.
+    """
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    index_dir = os.path.join(os.path.dirname(ckpt_path), f"{fold_id}_faiss_index")
+    return {
+        "fold_id": fold_id,
+        "patient_id": patient_id,
+        "test_seizure_idx": test_seizure_idx,
+        "val_auprc": ckpt.get("val_auprc"),
+        "temperature": ckpt.get("temperature"),
+        "checkpoint": ckpt_path,
+        "faiss_index_dir": index_dir if os.path.isdir(index_dir) else None,
+        "n_train_windows": ckpt.get("n_train_windows"),
+        "n_val_windows": ckpt.get("n_val_windows"),
+        "n_test_windows": ckpt.get("n_test_windows"),
+    }
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
@@ -588,27 +649,55 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
         for test_seizure_idx in range(n_folds):
             fold_id = f"{patient_id}_seizure{test_seizure_idx}"
+            ckpt_path = os.path.join(args.output_dir, f"{fold_id}.pt")
+
+            if not args.force_retrain and os.path.isfile(ckpt_path):
+                log.info(f"=== Fold {fold_id}: checkpoint already exists, skipping (--force_retrain to redo) ===")
+                summary.append(_reload_fold_summary_entry(fold_id, patient_id, test_seizure_idx, ckpt_path))
+                _write_training_summary(os.path.join(args.output_dir, "training_summary.json"), config, summary)
+                continue
+
             log.info(f"=== Training fold {fold_id} ===")
             try:
                 result = train_one_fold(patient_id, test_seizure_idx, config, device, logger=log)
-            except RuntimeError as exc:
-                log.warning(f"Skipping fold {fold_id}: {exc}")
+            except Exception as exc:
+                # Broad on purpose: a single anomalous fold (corrupt EDF, a
+                # linear-algebra singularity, CUDA OOM, ...) must never take
+                # down an unattended multi-hour Kaggle run. Full traceback
+                # goes to the log; the fold is simply skipped.
+                log.exception(f"Skipping fold {fold_id} (unexpected error: {exc})")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 continue
 
-            ckpt_path = os.path.join(args.output_dir, f"{fold_id}.pt")
+            # Move to CPU explicitly: keeps checkpoints loadable regardless of
+            # what device produced them, and never carries optimizer state --
+            # only the trained weights + the small scalars/metadata needed to
+            # reconstruct and evaluate the model (window counts included so a
+            # resumed run can rebuild this fold's summary entry without
+            # reloading the dataset).
+            cpu_state_dict = {k: v.detach().cpu() for k, v in result.model.state_dict().items()}
             torch.save(
                 {
-                    "model_state_dict": result.model.state_dict(),
+                    "model_state_dict": cpu_state_dict,
                     "model_kwargs": _model_kwargs(config),
                     "temperature": result.temperature,
                     "val_auprc": result.best_val_auprc,
                     "patient_id": patient_id,
                     "test_seizure_idx": test_seizure_idx,
                     "history": result.history,
+                    "n_train_windows": len(result.train_loader.dataset),
+                    "n_val_windows": len(result.val_loader.dataset),
+                    "n_test_windows": len(result.test_loader.dataset),
                 },
                 ckpt_path,
             )
-            log.info(f"Saved checkpoint: {ckpt_path} (val_auprc={result.best_val_auprc:.4f})")
+            ckpt_mb = os.path.getsize(ckpt_path) / 1e6
+            total_mb = _dir_size_bytes(args.output_dir) / 1e6
+            log.info(
+                f"Saved checkpoint: {ckpt_path} (val_auprc={result.best_val_auprc:.4f}, "
+                f"{ckpt_mb:.1f} MB; output_dir total so far: {total_mb:.1f} MB)"
+            )
 
             index_dir = os.path.join(args.output_dir, f"{fold_id}_faiss_index")
             index_export_ok = True
@@ -623,9 +712,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     stride=config.trajectory_stride,
                 )
                 db.save(index_dir)
-                log.info(f"Exported FAISS trajectory index: {index_dir}")
+                index_mb = _dir_size_bytes(index_dir) / 1e6
+                log.info(f"Exported FAISS trajectory index: {index_dir} ({index_mb:.1f} MB)")
             except Exception as exc:
-                log.warning(f"Failed to export FAISS index for {fold_id}: {exc}")
+                log.exception(f"Failed to export FAISS index for {fold_id}: {exc}")
                 index_export_ok = False
 
             summary.append(
@@ -642,10 +732,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     "n_test_windows": len(result.test_loader.dataset),
                 }
             )
+            _write_training_summary(os.path.join(args.output_dir, "training_summary.json"), config, summary)
 
     summary_path = os.path.join(args.output_dir, "training_summary.json")
-    with open(summary_path, "w") as f:
-        json.dump({"config": asdict(config), "folds": summary}, f, indent=2)
     log.info(f"Training complete. {len(summary)} fold(s) trained. Summary written to {summary_path}")
 
 

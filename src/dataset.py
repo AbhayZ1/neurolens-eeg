@@ -167,6 +167,58 @@ def _edf_duration_sec(filepath: str) -> float:
     return raw.n_times / raw.info["sfreq"]
 
 
+_DATA_DIR_CACHE: Dict[Tuple[str, str], str] = {}
+
+
+def resolve_data_dir(data_dir: str, patient_id: str, max_depth: int = 6) -> str:
+    """Resolves a possibly-nested dataset root to the directory that
+    directly contains `patient_id`'s subfolder.
+
+    Kaggle "Add Data" mounts frequently wrap the actual database under an
+    extra version-named directory, e.g.
+    ``/kaggle/input/chb-mit-scalp-eeg-database/chb-mit-scalp-eeg-database-1.0.0/chb01/...``
+    rather than ``chb01/`` sitting directly under the given root.
+
+    Fast path: if ``data_dir/patient_id/{patient_id}-summary.txt`` already
+    exists, `data_dir` is returned unchanged -- a no-op for an
+    already-flat local layout, with no filesystem walk at all.
+    Otherwise, searches recursively under `data_dir` (bounded to
+    `max_depth` levels, so a large unrelated ``/kaggle/input`` mount can't
+    trigger an unbounded scan) for a directory containing
+    ``{patient_id}-summary.txt``, and returns its PARENT -- the directory
+    that plays the same role as a flat `data_dir` for every function in
+    this module. Results are cached per (data_dir, patient_id) so the walk
+    only happens once even though every window-building call for that
+    patient goes through here.
+    """
+    cache_key = (data_dir, patient_id)
+    if cache_key in _DATA_DIR_CACHE:
+        return _DATA_DIR_CACHE[cache_key]
+
+    direct = os.path.join(data_dir, patient_id, f"{patient_id}-summary.txt")
+    if os.path.isfile(direct):
+        _DATA_DIR_CACHE[cache_key] = data_dir
+        return data_dir
+
+    target_name = f"{patient_id}-summary.txt"
+    base_depth = os.path.normpath(data_dir).count(os.sep)
+    for root, dirs, files in os.walk(data_dir):
+        depth = os.path.normpath(root).count(os.sep) - base_depth
+        if depth >= max_depth:
+            dirs[:] = []  # prune: do not descend further from here
+            continue
+        if target_name in files:
+            resolved = os.path.dirname(root)
+            _DATA_DIR_CACHE[cache_key] = resolved
+            return resolved
+
+    raise FileNotFoundError(
+        f"Could not find '{target_name}' anywhere under {data_dir} (searched up to "
+        f"{max_depth} levels deep). Check that --data_dir points at, or contains at any "
+        "nesting depth, the CHB-MIT database root."
+    )
+
+
 def build_patient_timeline(patient_id: str, data_dir: str) -> List[FileRecord]:
     """Reconstruct the patient's chronological recording timeline.
 
@@ -179,6 +231,7 @@ def build_patient_timeline(patient_id: str, data_dir: str) -> List[FileRecord]:
     the standard back-to-back assumption used throughout the seizure-
     prediction literature for this dataset.
     """
+    data_dir = resolve_data_dir(data_dir, patient_id)
     summary_path = os.path.join(data_dir, patient_id, f"{patient_id}-summary.txt")
     if not os.path.isfile(summary_path):
         raise FileNotFoundError(f"Summary file not found: {summary_path}")
