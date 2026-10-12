@@ -587,16 +587,30 @@ def get_loso_splits(
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """Build LOSO train/val/test DataLoaders for one held-out seizure.
 
-    Test set: the held-out seizure's preictal windows plus the maximal
-    contiguous run of interictal windows immediately preceding them --
-    together one continuous chronological span ending exactly at that
-    seizure's Seizure Prediction Horizon, with no shuffling.
+    Test set: the held-out seizure's preictal windows plus the nearest
+    available interictal windows chronologically before them (up to
+    ``len(test_preictal)``, so the test set stays roughly class-balanced
+    rather than becoming an unbounded interictal majority). These need not
+    be second-by-second contiguous with the preictal span -- clinical_metrics()
+    computes interictal-hours by counting interictal windows directly, not
+    by measuring elapsed wall-clock time, so a gap (e.g. another seizure's
+    exclusion buffer sitting between them) costs nothing downstream. An
+    earlier version required strict contiguity, which left many folds with
+    ZERO interictal test windows whenever the immediately-preceding 5s slot
+    wasn't itself labeled interictal -- common whenever seizures are closely
+    spaced, which silently made AUC-ROC/specificity/FPR-h undefined for
+    that fold.
 
     Train/val: every remaining window (all other seizures' preictal
-    windows, and all interictal windows not used by the test span), sorted
-    chronologically and split so validation is the most recent
-    ``val_fraction`` of that pool -- val and test are both temporally
-    ordered and never interleaved with training windows.
+    windows, and all interictal windows not used by the test span). val is
+    the most recent ``val_fraction`` of each class's own remaining pool,
+    not of the pool as a whole -- splitting per class guarantees both
+    classes appear in validation (needed for temperature-scaling and
+    AUPRC-based model selection to run at all) even though the whole-pool
+    timeline is preictal-sparse; it preserves the same "most recent slice
+    is held out" anti-leakage principle, just applied within each class
+    rather than across the mixed timeline where a long preictal run could
+    otherwise dominate the tail and crowd out the other class entirely.
     """
     if not (0.0 < val_fraction < 1.0):
         raise ValueError("val_fraction must be in (0, 1)")
@@ -617,24 +631,25 @@ def get_loso_splits(
         (w for w in windows if w.label == LABEL_INTERICTAL and w.abs_start_sec < boundary_abs),
         key=lambda w: w.abs_start_sec,
     )
-    test_interictal: List[WindowRecord] = []
-    expected_next_start = boundary_abs
-    for w in reversed(interictal_before):
-        if expected_next_start - w.abs_start_sec <= WINDOW_SEC + 1e-6:
-            test_interictal.append(w)
-            expected_next_start = w.abs_start_sec
-        else:
-            break
-    test_interictal.reverse()
+    n_test_interictal = max(len(test_preictal), 1)
+    test_interictal = interictal_before[-n_test_interictal:] if interictal_before else []
 
     test_windows = test_interictal + sorted(test_preictal, key=lambda w: w.abs_start_sec)
     test_keys = {(w.file_idx, w.start_sample) for w in test_windows}
 
     remaining = [w for w in windows if (w.file_idx, w.start_sample) not in test_keys]
-    remaining.sort(key=lambda w: w.abs_start_sec)
-    n_val = max(1, round(len(remaining) * val_fraction)) if remaining else 0
-    val_windows = remaining[len(remaining) - n_val :] if n_val else []
-    train_windows = remaining[: len(remaining) - n_val] if n_val else remaining
+
+    def _tail_split(pool: List[WindowRecord]) -> Tuple[List[WindowRecord], List[WindowRecord]]:
+        pool = sorted(pool, key=lambda w: w.abs_start_sec)
+        n_val = round(len(pool) * val_fraction) if pool else 0
+        if n_val == 0:
+            return pool, []
+        return pool[: len(pool) - n_val], pool[len(pool) - n_val :]
+
+    train_interictal, val_interictal = _tail_split([w for w in remaining if w.label == LABEL_INTERICTAL])
+    train_preictal, val_preictal = _tail_split([w for w in remaining if w.label == LABEL_PREICTAL])
+    train_windows = sorted(train_interictal + train_preictal, key=lambda w: w.abs_start_sec)
+    val_windows = sorted(val_interictal + val_preictal, key=lambda w: w.abs_start_sec)
 
     if not train_windows or not val_windows or not test_windows:
         raise RuntimeError(
