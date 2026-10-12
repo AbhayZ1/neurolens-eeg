@@ -412,6 +412,27 @@ def compute_tas_curve(
     return np.asarray(tas_times, dtype=np.float64), np.asarray(tas_series, dtype=np.float64)
 
 
+_SYNTH_CACHE: Dict[Tuple[float, float, float, int], object] = {}
+
+
+def _cached_synthetic_dataset(duration_mins: float, transition_start_min: float, transition_duration_min: float, seed: int):
+    """generate_synthetic_bifurcation_dataset is fully deterministic given its
+    arguments and independent of the fold/model under test, but costs minutes
+    of CPU per call (RK4 integration). Every fold asks for the same
+    (seed0 + trial) recordings, so generate each one once per process."""
+    key = (duration_mins, transition_start_min, transition_duration_min, seed)
+    if key not in _SYNTH_CACHE:
+        _SYNTH_CACHE[key] = generate_synthetic_bifurcation_dataset(
+            duration_mins=duration_mins,
+            sampling_rate=256,
+            n_channels=18,
+            transition_start_min=transition_start_min,
+            transition_duration_min=transition_duration_min,
+            seed=seed,
+        )
+    return _SYNTH_CACHE[key]
+
+
 def bifurcation_benchmark(
     model: NeuroLensBackbone,
     faiss_db: TrajectoryVectorDB,
@@ -435,14 +456,7 @@ def bifurcation_benchmark(
     trials = []
     for trial in range(n_trials):
         seed = seed0 + trial
-        synth = generate_synthetic_bifurcation_dataset(
-            duration_mins=duration_mins,
-            sampling_rate=256,
-            n_channels=18,
-            transition_start_min=transition_start_min,
-            transition_duration_min=transition_duration_min,
-            seed=seed,
-        )
+        synth = _cached_synthetic_dataset(duration_mins, transition_start_min, transition_duration_min, seed)
         eeg = synth.eeg_uv.numpy()  # [18, n_samples]
         n_windows = eeg.shape[1] // N_SAMPLES
         eeg = eeg[:, : n_windows * N_SAMPLES]

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -411,14 +412,61 @@ def _resolve_channel_name(available: List[str], canonical: str) -> str:
     raise ValueError(f"Required channel '{canonical}' not found among {available}")
 
 
-def load_bipolar_preprocessed(filepath: str) -> np.ndarray:
+_CACHE_VERSION = "v1"
+
+
+def _edf_cache_path(filepath: str) -> str:
+    """On-disk location of one EDF's preprocessed array.
+
+    Keyed on patient folder + file name + source size + every preprocessing
+    constant, so changing the filter settings (or swapping in a different
+    copy of the dataset) can never silently reuse a stale array.
+    """
+    root = os.environ.get("NEUROLENS_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "neurolens_edf_cache")
+    stem = os.path.splitext(os.path.basename(filepath))[0]
+    patient = os.path.basename(os.path.dirname(filepath))
+    tag = f"{_CACHE_VERSION}_fs{FS}_bp{BANDPASS_LOW_HZ}-{BANDPASS_HIGH_HZ}o{BANDPASS_ORDER}_n{NOTCH_FREQ_HZ}_sz{os.path.getsize(filepath)}"
+    return os.path.join(root, patient, f"{stem}_{tag}.npy")
+
+
+def load_bipolar_preprocessed(filepath: str, use_cache: bool = True) -> np.ndarray:
     """Load one EDF, enforce the 18-channel bipolar montage, and preprocess.
 
     Pipeline: pick + reorder to BIPOLAR_MONTAGE -> resample to FS Hz ->
     zero-phase 4th-order Butterworth bandpass (0.5-45 Hz) -> 60 Hz notch.
 
     Returns a (N_CHANNELS, n_samples) float32 array in microvolts.
+
+    With ``use_cache`` (default) the result is written once to a per-file
+    ``.npy`` (``$NEUROLENS_CACHE_DIR``, default: system temp dir) and every
+    later call -- including from other DataLoader workers or other scripts
+    -- returns a read-only memory map of it instead of re-reading and
+    re-filtering ~1 hour of EEG (~5 s per file). The values are identical
+    to the uncached path; only the repeated work is removed.
     """
+    if not use_cache:
+        return _preprocess_edf(filepath)
+
+    cache_path = _edf_cache_path(filepath)
+    if os.path.isfile(cache_path):
+        return np.load(cache_path, mmap_mode="r")
+
+    data = _preprocess_edf(filepath)
+    tmp_path = f"{cache_path}.{os.getpid()}.tmp"
+    try:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        with open(tmp_path, "wb") as f:
+            np.save(f, data)
+        os.replace(tmp_path, cache_path)  # atomic: concurrent workers never see a half-written file
+    except OSError:
+        # Cache disk full/unwritable: fall back to the in-memory array rather than fail the run.
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        return data
+    return np.load(cache_path, mmap_mode="r")
+
+
+def _preprocess_edf(filepath: str) -> np.ndarray:
     raw = mne.io.read_raw_edf(filepath, preload=True, verbose=False)
     raw.rename_channels({ch: ch.strip() for ch in raw.ch_names})
 
@@ -496,7 +544,7 @@ class CHBMITChronologicalDataset(Dataset):
                 f"truncated ({segment.shape[1]} < {N_SAMPLES} samples); the patient "
                 "timeline is inconsistent with the underlying EDF file."
             )
-        return torch.from_numpy(segment.copy()), w.label
+        return torch.from_numpy(np.array(segment)), w.label
 
 
 class TimestampedWindowDataset(Dataset):
