@@ -733,9 +733,14 @@ class CounterfactualSteeringEngine:
             )
 
         if vec is not None:
-            triu_row = tangent_projector.triu_row
-            triu_col = tangent_projector.triu_col
-            vec_scale = tangent_projector.vec_scale.to(vec.dtype)
+            # delta (and therefore vec) was explicitly moved to CPU above for
+            # the numpy conversion this function returns -- but
+            # tangent_projector's own buffers live on the model's device
+            # (CUDA during a real GPU run), so they must be pulled to CPU
+            # too before mixing with vec/mat, not just dtype-cast.
+            triu_row = tangent_projector.triu_row.cpu()
+            triu_col = tangent_projector.triu_col.cpu()
+            vec_scale = tangent_projector.vec_scale.to(device="cpu", dtype=vec.dtype)
             raw_vals = vec / vec_scale
             mat = torch.zeros(C, C, dtype=vec.dtype)
             mat[triu_row, triu_col] = raw_vals
