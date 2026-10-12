@@ -655,7 +655,8 @@ class CounterfactualSteeringEngine:
         state (a standard choice for gradient-based attribution).
         """
         encoder = model.encoder
-        x = raw_window
+        model_device = next(model.parameters()).device
+        x = raw_window.to(model_device)
         if x.dim() == 2:
             x = x.unsqueeze(0)
         was_training = model.training
@@ -679,7 +680,7 @@ class CounterfactualSteeringEngine:
                 fused = encoder.fuse(torch.cat(scale_summaries, dim=-1))
                 z = F.normalize(model.latent_head(fused), p=2, dim=-1)
 
-                grad_outputs = delta_z if delta_z.dim() == z.dim() else delta_z.unsqueeze(0)
+                grad_outputs = (delta_z if delta_z.dim() == z.dim() else delta_z.unsqueeze(0)).to(model_device)
                 (delta_tangent,) = torch.autograd.grad(
                     outputs=z, inputs=tangent, grad_outputs=grad_outputs, retain_graph=False
                 )

@@ -130,7 +130,7 @@ class RiemannianTangentProjector(nn.Module):
     def _vectorize(self, sym_mat: torch.Tensor) -> torch.Tensor:
         """sym_mat: [..., C, C] -> [..., C*(C+1)/2], Frobenius-preserving."""
         vec = sym_mat[..., self.triu_row, self.triu_col]
-        return vec * self.vec_scale.to(dtype=sym_mat.dtype)
+        return vec * self.vec_scale.to(device=sym_mat.device, dtype=sym_mat.dtype)
 
     def forward(self, x_patches: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """x_patches: [B, N, C, L] -> (tangent_vectors [B, N, D], frechet_mean_logm [B, C, C])."""
